@@ -102,6 +102,11 @@ impl MergeSeq {
     fn push_flattened_value(value: &Value, values: &mut Vec<Value>) {
         let mut pending = vec![value.clone()];
         while let Some(value) = pending.pop() {
+            // A doubled `s = s + s` chain can hold 2^depth
+            // leaves; stop flattening once interrupted.
+            if crate::interrupt::is_interrupted() {
+                break;
+            }
             if let Some(seq) = value.downcast_object_ref::<Self>() {
                 pending.extend(seq.values.iter().rev().cloned());
             } else {

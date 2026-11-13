@@ -1363,7 +1363,8 @@ impl Value {
     /// ```
     pub fn len(&self) -> Option<usize> {
         match self.0 {
-            ValueRepr::String(ref s, _) => Some(s.chars().count()),
+            // Counting a heap string observes the interrupt.
+            ValueRepr::String(ref s, _) => Some(crate::interrupt::char_count(s)),
             ValueRepr::SmallStr(ref s) => Some(s.as_str().chars().count()),
             ValueRepr::Bytes(ref b) => Some(b.len()),
             ValueRepr::Object(ref dy) => dy.enumerator_len(),
@@ -1475,18 +1476,41 @@ impl Value {
     pub fn try_iter(&self) -> Result<ValueIter, Error> {
         match self.0 {
             ValueRepr::None | ValueRepr::Undefined(_) => Some(ValueIterImpl::Empty),
-            ValueRepr::String(ref s, _) => {
-                Some(ValueIterImpl::Chars(0, s.chars().count(), Arc::clone(s)))
-            }
+            ValueRepr::String(ref s, _) => Some(ValueIterImpl::Chars(
+                0,
+                crate::interrupt::char_count(s),
+                Arc::clone(s),
+            )),
             ValueRepr::SmallStr(ref s) => Some(ValueIterImpl::Chars(
                 0,
                 s.as_str().chars().count(),
                 Arc::from(s.as_str()),
             )),
-            ValueRepr::Object(ref obj) => obj.try_iter().map(ValueIterImpl::Dyn),
+            ValueRepr::Object(ref obj) => obj.try_iter_unguarded().map(ValueIterImpl::Dyn),
             _ => None,
         }
-        .map(|imp| ValueIter { imp })
+        .map(|imp| {
+            // Record the exact length from the unguarded
+            // iterator (for-loops read `loop.length`, `revindex` and `last`
+            // from it), then guard the iteration once a flag is installed.
+            // The guard preserves the inner lower bound while the flag is
+            // unset -- lazy wrappers and `|length` rely on that hint -- and
+            // reports zero only once the flag is set, which stays true when
+            // the interrupt ends iteration early.
+            let raw = ValueIter {
+                imp,
+                exact_len: None,
+            };
+            let exact_len = match raw.size_hint() {
+                (lower, Some(upper)) if lower == upper => Some(lower),
+                _ => None,
+            };
+            let imp = match crate::interrupt::current() {
+                Some(_) => ValueIterImpl::Dyn(crate::interrupt::guard(Box::new(raw))),
+                None => raw.imp,
+            };
+            ValueIter { imp, exact_len }
+        })
         .ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidOperation,
@@ -1506,13 +1530,16 @@ impl Value {
     pub fn reverse(&self) -> Result<Value, Error> {
         match self.0 {
             ValueRepr::Undefined(_) | ValueRepr::None => Some(self.clone()),
-            ValueRepr::String(ref s, _) => Some(Value::from(s.chars().rev().collect::<String>())),
+            // String and byte reversal stops once interrupted.
+            ValueRepr::String(ref s, _) => Some(Value::from(
+                crate::interrupt::guard_native(s.chars().rev()).collect::<String>(),
+            )),
             ValueRepr::SmallStr(ref s) => {
                 // TODO: add small str optimization here
                 Some(Value::from(s.as_str().chars().rev().collect::<String>()))
             }
             ValueRepr::Bytes(ref b) => Some(Value::from_bytes(
-                b.iter().rev().copied().collect::<Vec<_>>(),
+                crate::interrupt::guard_native(b.iter().rev().copied()).collect::<Vec<_>>(),
             )),
             ValueRepr::Object(ref o) => match o.enumerate() {
                 Enumerator::NonEnumerable => None,
@@ -1527,17 +1554,21 @@ impl Value {
                     }))
                 }
                 Enumerator::Iter(iter) => {
-                    let mut v = iter.collect::<Vec<_>>();
+                    // Stop collecting once interrupted.
+                    let mut v = crate::interrupt::collect_vec(crate::interrupt::guard(iter));
                     v.reverse();
                     Some(Value::make_object_iterable(v, move |v| {
                         Box::new(v.iter().cloned())
                     }))
                 }
                 Enumerator::KeyValueIter(iter) => {
+                    // Bound the collection and stop once
+                    // interrupted, as the `Iter` arm does.
+                    let iter = crate::interrupt::guard(iter);
                     let mut v = if let ObjectRepr::Map = o.repr() {
-                        iter.map(|(k, _)| k).collect::<Vec<_>>()
+                        crate::interrupt::collect_vec(iter.map(|(k, _)| k))
                     } else {
-                        iter.map(|(k, v)| [k, v].into()).collect::<Vec<_>>()
+                        crate::interrupt::collect_vec(iter.map(|(k, v)| [k, v].into()))
                     };
                     v.reverse();
                     Some(Value::make_object_iterable(v, move |v| {
@@ -1674,9 +1705,13 @@ impl Value {
                     dy.get_value(idx.as_ref().unwrap_or(key))
                 }
             },
+            // Counting and walking a heap string observe the
+            // interrupt.
             ValueRepr::String(ref s, _) => {
-                let idx = some!(index(key, || Some(s.chars().count())));
-                s.chars().nth(idx).map(Value::from)
+                let idx = some!(index(key, || Some(crate::interrupt::char_count(s))));
+                crate::interrupt::guard_native(s.chars())
+                    .nth(idx)
+                    .map(Value::from)
             }
             ValueRepr::SmallStr(ref s) => {
                 let idx = some!(index(key, || Some(s.as_str().chars().count())));
@@ -1929,6 +1964,17 @@ where
 /// Utility to iterate over values.
 pub struct ValueIter {
     imp: ValueIterImpl,
+    // The exact length of the unguarded iteration, if known.
+    exact_len: Option<usize>,
+}
+
+impl ValueIter {
+    /// The exact element count the iteration had before any
+    /// interrupt guard was applied, derived from an equal
+    /// lower and upper size hint. For-loops use it for `loop.length`.
+    pub(crate) fn exact_len(&self) -> Option<usize> {
+        self.exact_len
+    }
 }
 
 impl Iterator for ValueIter {

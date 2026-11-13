@@ -204,6 +204,8 @@ impl<'env> Vm<'env> {
         let mut next_loop_recursion_jump = None;
         let mut loaded_filters = [None; MAX_LOCALS];
         let mut loaded_tests = [None; MAX_LOCALS];
+        // The thread's interrupt flag (see `crate::interrupt`).
+        let interrupt = crate::interrupt::current();
 
         // If we are extending we are holding the instructions of the target parent
         // template here.  This is used to detect multiple extends and the evaluation
@@ -311,6 +313,15 @@ impl<'env> Vm<'env> {
                         Err(err) => bail!(err),
                     }
                 }};
+            }
+
+            // Fail at the next instruction once interrupted, so
+            // a render whose native work was cut short never succeeds with a
+            // truncated result.
+            if let Some(ref interrupt) = interrupt {
+                if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+                    bail!(crate::interrupt::interrupted_error());
+                }
             }
 
             // if the fuel consumption feature is enabled, track the fuel
@@ -798,6 +809,15 @@ impl<'env> Vm<'env> {
                 }
             }
             pc += 1;
+        }
+
+        // The last instruction may itself have been cut short.
+        if let Some(ref interrupt) = interrupt {
+            if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut err = crate::interrupt::interrupted_error();
+                process_err(&mut err, pc.saturating_sub(1), state);
+                return Err(err);
+            }
         }
 
         Ok(stack.try_pop())

@@ -165,20 +165,24 @@ pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Val
         ValueRepr::String(..) | ValueRepr::SmallStr(_) => {
             let s = value.as_str().unwrap();
             if step > 0 {
-                let (start, len) = get_offset_and_len(start, stop, || s.chars().count());
+                let (start, len) =
+                    get_offset_and_len(start, stop, || crate::interrupt::char_count(s));
+                // String and byte slicing stops once interrupted.
                 Ok(Value::from(
-                    s.chars()
+                    crate::interrupt::guard_native(s.chars())
                         .skip(start)
                         .take(len)
                         .step_by(step as usize)
                         .collect::<String>(),
                 ))
             } else {
-                let chars: Vec<char> = s.chars().collect();
+                let chars: Vec<char> = crate::interrupt::guard_native(s.chars()).collect();
                 Ok(Value::from(
-                    range_step_backwards(start, stop, -step as usize, chars.len())
-                        .map(move |i| chars[i])
-                        .collect::<String>(),
+                    crate::interrupt::guard_native(
+                        range_step_backwards(start, stop, -step as usize, chars.len())
+                            .map(move |i| chars[i]),
+                    )
+                    .collect::<String>(),
                 ))
             }
         }
@@ -186,7 +190,7 @@ pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Val
             if step > 0 {
                 let (start, len) = get_offset_and_len(start, stop, || b.len());
                 Ok(Value::from_bytes(
-                    b.iter()
+                    crate::interrupt::guard_native(b.iter())
                         .skip(start)
                         .take(len)
                         .step_by(step as usize)
@@ -195,9 +199,10 @@ pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Val
                 ))
             } else {
                 Ok(Value::from_bytes(
-                    range_step_backwards(start, stop, -step as usize, b.len())
-                        .map(|i| b[i])
-                        .collect::<Vec<u8>>(),
+                    crate::interrupt::guard_native(
+                        range_step_backwards(start, stop, -step as usize, b.len()).map(|i| b[i]),
+                    )
+                    .collect::<Vec<u8>>(),
                 ))
             }
         }
@@ -216,7 +221,10 @@ pub fn slice(value: Value, start: Value, stop: Value, step: Value) -> Result<Val
             } else {
                 Ok(Value::make_object_iterable(obj.clone(), move |obj| {
                     if let Some(iter) = obj.try_iter() {
-                        let vec: Vec<Value> = iter.collect();
+                        // The source may be a lazy sequence
+                        // whose exact hint is its virtual length; never
+                        // reserve it up front (see `interrupt::collect_vec`).
+                        let vec: Vec<Value> = crate::interrupt::collect_vec(iter);
                         Box::new(
                             range_step_backwards(start, stop, -step as usize, vec.len())
                                 .map(move |i| vec[i].clone()),
@@ -278,9 +286,11 @@ fn seq_concat_len(lhs: &Value, rhs: &Value) -> Option<usize> {
 }
 
 fn materialize_seq_concat(lhs: &Value, rhs: &Value, len: usize) -> Result<Value, Error> {
-    let mut rv = Vec::with_capacity(len);
-    rv.extend(ok!(lhs.try_iter()));
-    rv.extend(ok!(rhs.try_iter()));
+    // `len` is the virtual length of a possibly lazy chain;
+    // an interrupt-enabled thread reserves at most the preallocation ceiling.
+    let mut rv = Vec::with_capacity(crate::interrupt::prealloc(len));
+    crate::interrupt::extend_vec(&mut rv, ok!(lhs.try_iter()));
+    crate::interrupt::extend_vec(&mut rv, ok!(rhs.try_iter()));
     Ok(Value::from(rv))
 }
 
@@ -380,17 +390,21 @@ fn repeat_iterable(n: &Value, seq: &DynObject) -> Result<Value, Error> {
     Ok(Value::make_object_iterable(seq.clone(), move |seq| {
         Box::new(LenIterWrap(
             len * n,
-            (0..n).flat_map(move |_| {
-                seq.try_iter().unwrap_or_else(|| {
-                    Box::new(
-                        std::iter::repeat(Value::from(Error::new(
-                            ErrorKind::InvalidOperation,
-                            "iterable did not iterate against expectations",
-                        )))
-                        .take(len),
-                    )
-                })
-            }),
+            // Once interrupted every repetition is empty, so the
+            // outer range must stop too or it would spin through all `n`.
+            (0..n)
+                .take_while(|_| !crate::interrupt::is_interrupted())
+                .flat_map(move |_| {
+                    seq.try_iter().unwrap_or_else(|| {
+                        Box::new(
+                            std::iter::repeat(Value::from(Error::new(
+                                ErrorKind::InvalidOperation,
+                                "iterable did not iterate against expectations",
+                            )))
+                            .take(len),
+                        )
+                    })
+                }),
         ))
     }))
 }

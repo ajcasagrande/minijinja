@@ -351,12 +351,14 @@ mod builtins {
         let by_value = matches!(ok!(kwargs.get("by")), Some("value"));
         let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
         let reverse = ok!(kwargs.get::<Option<bool>>("reverse")).unwrap_or(false);
+        // Collectors never reserve a virtual length up front.
         let mut rv: Vec<_> = if let Some(iter) = v.as_object().and_then(|v| v.try_iter_pairs()) {
-            iter.collect()
+            crate::interrupt::collect_vec(iter)
         } else {
-            ok!(v.try_iter())
-                .map(|key| (key.clone(), v.get_item(&key).unwrap_or(Value::UNDEFINED)))
-                .collect()
+            crate::interrupt::collect_vec(
+                ok!(v.try_iter())
+                    .map(|key| (key.clone(), v.get_item(&key).unwrap_or(Value::UNDEFINED))),
+            )
         };
         safe_sort(&mut rv, |a, b| {
             let (a, b) = if by_value { (&a.1, &b.1) } else { (&a.0, &b.0) };
@@ -419,7 +421,8 @@ mod builtins {
     pub fn reverse(value: &Value) -> Result<Value, Error> {
         if value.kind() == ValueKind::String {
             let string = value.as_str().unwrap();
-            let output = string.chars().rev().collect::<String>();
+            // A string of up to 100 MB; stop once interrupted.
+            let output = crate::interrupt::guard_native(string.chars().rev()).collect::<String>();
             if value.is_safe() {
                 Ok(Value::from_safe_string(output))
             } else {
@@ -522,7 +525,7 @@ mod builtins {
 
         // A plain joiner only becomes safe if at least one item is safe.  This
         // is the one case where the iterable must be inspected before output.
-        let items = iter.collect::<Vec<_>>();
+        let items = crate::interrupt::collect_vec(iter);
         if items.iter().any(Value::is_safe) {
             let joiner = match joiner.as_ref() {
                 Some(joiner) => ok!(joiner.format(state)),
@@ -902,10 +905,13 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn sort(state: &State, value: Value, kwargs: Kwargs) -> Result<Value, Error> {
-        let mut items = ok!(state.undefined_behavior().try_iter(value).map_err(|err| {
-            Error::new(ErrorKind::InvalidOperation, "cannot convert value to list").with_source(err)
-        }))
-        .collect::<Vec<_>>();
+        let mut items = crate::interrupt::collect_vec(ok!(state
+            .undefined_behavior()
+            .try_iter(value)
+            .map_err(|err| {
+                Error::new(ErrorKind::InvalidOperation, "cannot convert value to list")
+                    .with_source(err)
+            })));
 
         let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
         let reverse = ok!(kwargs.get::<Option<bool>>("reverse")).unwrap_or(false);
@@ -964,7 +970,7 @@ mod builtins {
         let iter = ok!(state.undefined_behavior().try_iter(value).map_err(|err| {
             Error::new(ErrorKind::InvalidOperation, "cannot convert value to list").with_source(err)
         }));
-        Ok(Value::from(iter.collect::<Vec<_>>()))
+        Ok(Value::from(crate::interrupt::collect_vec(iter)))
     }
 
     /// Converts a value into a string if it's not one already.
@@ -1023,12 +1029,12 @@ mod builtins {
         if count == 0 {
             return Err(Error::new(ErrorKind::InvalidOperation, "count cannot be 0"));
         }
-        let items = ok!(state.undefined_behavior().try_iter(value)).collect::<Vec<_>>();
+        let items = crate::interrupt::collect_vec(ok!(state.undefined_behavior().try_iter(value)));
         let len = items.len();
         let items_per_slice = len / count;
         let slices_with_extra = len % count;
         let mut offset = 0;
-        let mut rv = Vec::with_capacity(count);
+        let mut rv = Vec::with_capacity(crate::interrupt::prealloc(count));
 
         for slice in 0..count {
             let start = offset + slice * items_per_slice;
@@ -1080,14 +1086,15 @@ mod builtins {
         if count == 0 {
             return Err(Error::new(ErrorKind::InvalidOperation, "count cannot be 0"));
         }
-        let mut rv = Vec::with_capacity(value.len().unwrap_or(0) / count);
-        let mut tmp = Vec::with_capacity(count);
+        let mut rv =
+            Vec::with_capacity(crate::interrupt::prealloc(value.len().unwrap_or(0) / count));
+        let mut tmp = Vec::with_capacity(crate::interrupt::prealloc(count));
 
         for item in ok!(state.undefined_behavior().try_iter(value)) {
             if tmp.len() == count {
                 rv.push(Value::from(mem::replace(
                     &mut tmp,
-                    Vec::with_capacity(count),
+                    Vec::with_capacity(crate::interrupt::prealloc(count)),
                 )));
             }
             tmp.push(item);
@@ -1447,7 +1454,7 @@ mod builtins {
         value: Value,
         args: crate::value::Rest<Value>,
     ) -> Result<Vec<Value>, Error> {
-        let mut rv = Vec::with_capacity(value.len().unwrap_or(0));
+        let mut rv = Vec::with_capacity(crate::interrupt::prealloc(value.len().unwrap_or(0)));
 
         // attribute mapping
         let (args, kwargs): (&[Value], Kwargs) = crate::value::from_args(&args)?;
@@ -1560,7 +1567,7 @@ mod builtins {
             Some(attr) => attr,
             None => ok!(kwargs.get::<&str>("attribute")),
         };
-        let mut items: Vec<Value> = ok!(value.try_iter()).collect();
+        let mut items: Vec<Value> = crate::interrupt::collect_vec(ok!(value.try_iter()));
         safe_sort(&mut items, |a, b| {
             let a = a.get_path_or_default(attr, &default);
             let b = b.get_path_or_default(attr, &default);

@@ -34,10 +34,9 @@ impl LoopState {
         // consider them to have ExactSizeIterator semantics.  We do however not
         // expect ExactSizeIterator bounds themselves to support iteration by
         // other means.
-        let len = match iter.size_hint() {
-            (lower, Some(upper)) if lower == upper => Some(lower),
-            _ => None,
-        };
+        // Read the exactness recorded before the interrupt
+        // guard, whose own hint has a zero lower bound.
+        let len = iter.exact_len();
         LoopState {
             with_loop_var,
             current_recursion_jump,

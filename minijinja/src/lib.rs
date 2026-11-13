@@ -214,6 +214,8 @@ mod error;
 mod expression;
 #[cfg(feature = "builtins")]
 mod format_utils;
+// Per-thread cooperative interruption (src/interrupt.rs).
+mod interrupt;
 mod output;
 mod template;
 mod utils;
@@ -237,6 +239,8 @@ pub use self::defaults::{default_auto_escape_callback, escape_formatter};
 pub use self::environment::Environment;
 pub use self::error::{Error, ErrorKind};
 pub use self::expression::Expression;
+// The public entry point that installs the per-thread flag.
+pub use self::interrupt::set_thread_interrupt;
 pub use self::output::Output;
 pub use self::template::{Captured, Template};
 pub use self::utils::{AutoEscape, HtmlEscape, UndefinedBehavior};

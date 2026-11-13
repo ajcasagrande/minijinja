@@ -319,6 +319,43 @@ pub trait Object: fmt::Debug + Send + Sync {
     }
 }
 
+/// The unguarded `try_iter` body, shared by the guarded
+/// `try_iter` and the crate-private `DynObject::try_iter_unguarded` (which
+/// `Value::try_iter` uses to read the exact length before guarding).
+macro_rules! raw_try_iter {
+    ($self:ident) => {{
+        let iter: Option<Box<dyn Iterator<Item = Value> + Send + Sync>> = match $self.enumerate() {
+            Enumerator::NonEnumerable => None,
+            Enumerator::Empty => Some(Box::new(None::<Value>.into_iter())),
+            Enumerator::Seq(l) => {
+                let self_clone = $self.clone();
+                Some(Box::new((0..l).map(move |idx| {
+                    self_clone.get_value(&Value::from(idx)).unwrap_or_default()
+                })))
+            }
+            Enumerator::Iter(iter) => Some(iter),
+            Enumerator::KeyValueIter(iter) => {
+                if let ObjectRepr::Map = $self.repr() {
+                    Some(Box::new(iter.map(|(key, _)| key)))
+                } else {
+                    Some(Box::new(iter.map(|(key, val)| [key, val].into())))
+                }
+            }
+            Enumerator::RevIter(iter) => Some(Box::new(iter)),
+            Enumerator::RevKeyValueIter(iter) => {
+                if let ObjectRepr::Map = $self.repr() {
+                    Some(Box::new(iter.map(|(key, _)| key)))
+                } else {
+                    Some(Box::new(iter.map(|(key, val)| [key, val].into())))
+                }
+            }
+            Enumerator::Str(s) => Some(Box::new(s.iter().copied().map(Value::from))),
+            Enumerator::Values(v) => Some(Box::new(v.into_iter())),
+        };
+        iter
+    }};
+}
+
 macro_rules! impl_object_helpers {
     ($vis:vis $self_ty: ty) => {
         /// Iterates over this object.
@@ -329,34 +366,10 @@ macro_rules! impl_object_helpers {
         where
             Self: 'static,
         {
-            match self.enumerate() {
-                Enumerator::NonEnumerable => None,
-                Enumerator::Empty => Some(Box::new(None::<Value>.into_iter())),
-                Enumerator::Seq(l) => {
-                    let self_clone = self.clone();
-                    Some(Box::new((0..l).map(move |idx| {
-                        self_clone.get_value(&Value::from(idx)).unwrap_or_default()
-                    })))
-                }
-                Enumerator::Iter(iter) => Some(iter),
-                Enumerator::KeyValueIter(iter) => {
-                    if let ObjectRepr::Map = self.repr() {
-                        Some(Box::new(iter.map(|(key, _)| key)))
-                    } else {
-                        Some(Box::new(iter.map(|(key, val)| [key, val].into())))
-                    }
-                }
-                Enumerator::RevIter(iter) => Some(Box::new(iter)),
-                Enumerator::RevKeyValueIter(iter) => {
-                    if let ObjectRepr::Map = self.repr() {
-                        Some(Box::new(iter.map(|(key, _)| key)))
-                    } else {
-                        Some(Box::new(iter.map(|(key, val)| [key, val].into())))
-                    }
-                }
-                Enumerator::Str(s) => Some(Box::new(s.iter().copied().map(Value::from))),
-                Enumerator::Values(v) => Some(Box::new(v.into_iter())),
-            }
+            // Every native iteration (`in`, sequence `==`,
+            // printing, filters, loops) goes through here and ends early once
+            // the thread's interrupt flag is set (see `crate::interrupt`).
+            raw_try_iter!(self).map(crate::interrupt::guard)
         }
 
         /// Iterate over key and value at once.
@@ -365,8 +378,10 @@ macro_rules! impl_object_helpers {
         ) -> Option<Box<dyn Iterator<Item = (Value, Value)> + Send + Sync>> {
             if let ObjectRepr::Map = self.repr() {
                 match self.enumerate() {
-                    Enumerator::KeyValueIter(iter) => Some(iter),
-                    Enumerator::RevKeyValueIter(iter) => Some(Box::new(iter)),
+                    Enumerator::KeyValueIter(iter) => Some(crate::interrupt::guard(iter)),
+                    Enumerator::RevKeyValueIter(iter) => Some(crate::interrupt::guard(
+                        Box::new(iter) as Box<dyn Iterator<Item = (Value, Value)> + Send + Sync>,
+                    )),
                     _ => {
                         let iter = some!(self.try_iter());
                         let self_clone = self.clone();
@@ -863,6 +878,14 @@ unsafe impl Sync for DynObject {}
 
 impl DynObject {
     impl_object_helpers!(pub &Self);
+
+    /// `try_iter` without the interrupt guard, for callers that
+    /// must read the iterator's own size hint before guarding it.
+    pub(crate) fn try_iter_unguarded(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = Value> + Send + Sync>> {
+        raw_try_iter!(self)
+    }
 
     /// Checks if this dyn object is the same as another.
     pub(crate) fn is_same_object(&self, other: &DynObject) -> bool {
